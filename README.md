@@ -9,7 +9,7 @@ I'm Gabriel Schupp, a passionate math and science teacher with a love for coding
 - 🥋 Judo & BJJ Fighter
 
 ## 🔗 Connect with Me
-- [LinkedIn]((https://www.linkedin.com/in/gabriel-schupp-a0b010278/))
+- [LinkedIn](https://www.linkedin.com/in/gabriel-schupp-a0b010278/)
 
 ## 📚 Some of My Projects
 - [Project 1](https://github.com/GSPHYTON345/Codes)
