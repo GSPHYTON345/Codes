@@ -1,0 +1,116 @@
+//@version=5
+strategy("Supertrend + MACD Strategy", shorttitle="ST+MACD Cl", overlay=true, process_orders_on_close=true, pyramiding=10, initial_capital=100000)
+atrPeriod = input.int(12, title="ATR Period")
+multiplier = input.float(2.5, title="Multiplier") 
+fastLength = input.int(45, title="Fast Length")
+slowLength = input.int(40, title="Slow Length")
+signalLength = input.int(28, title="Signal Smoothing")
+// Initialize capital and profit tracking  
+var float cumulative_profit = 0
+var float initial_capital = 100000 
+
+// Function to calculate Supertrend
+getSupertrend(src, atrPeriod, multiplier) =>
+    atr = ta.atr(atrPeriod)
+    up = src - (multiplier * atr)
+    dn = src + (multiplier * atr)
+    var trend = 1
+    trend := na(trend[1]) ? 1 : (close > dn[1] ? 1 : close < up[1] ? -1 : trend[1])
+    up := trend == 1 and close > up[1] ? math.max(up, up[1]) : up
+    dn := trend == -1 and close < dn[1] ? math.min(dn, dn[1]) : dn
+    finalBand = trend == 1 ? up : dn
+    [finalBand, trend] 
+
+[stBand, stTrend] = getSupertrend(hl2, atrPeriod, multiplier)
+
+// Plotting Supertrend
+plot(stBand, "Supertrend", color=stTrend == 1 ? color.green : color.red)
+
+// Calculate MACD
+[macdLine, signalLine, _] = ta.macd(close, fastLength, slowLength, signalLength)
+
+// Plot MACD for visual confirmation
+plot(macdLine, "MACD Line", color=color.blue)
+plot(signalLine, "Signal Line", color=color.orange)  
+
+// Define entry conditions based on Supertrend and MACD confirmation
+longCondition = (stTrend == 1 and macdLine > signalLine and close > stBand) and (stTrend[1] == -1)
+shortCondition = (stTrend == -1 and macdLine < signalLine and close < stBand) and (stTrend[1] == 1)
+
+// Trading session spec for Zurich 7:30 AM to 9:30 PM
+sessionSpec = "0630-1930"
+// Time filter for Zurich trading hours
+isTradingHours = not na(time(timeframe.period, sessionSpec))
+
+// Define and store initial stop loss and take profit levels when entering positions
+var float longStop = na
+var float shortStop = na
+var float longTakeProfit = na
+var float shortTakeProfit = na
+
+// Check for trade closings on each bar and accumulate profits
+if (bar_index > 0)  // Avoid processing on the first bar
+    var int last_trade_index = na  // Track the last processed trade index
+    if (na(last_trade_index) or strategy.closedtrades > last_trade_index + 1)
+        last_trade_index := strategy.closedtrades - 1
+        cumulative_profit += strategy.closedtrades.profit(last_trade_index)
+
+// Calculate risk-based stop loss level and position sizing
+risk_per_trade = strategy.equity * 0.01
+risk_pips = math.abs(close - stBand)
+qty = risk_per_trade / risk_pips // Quanto ti vale un pip
+
+
+// Manage trades with dynamic risk and take profit calculation
+var label longLabel = na
+var label shortLabel = na
+
+if (longCondition and isTradingHours)
+    longStop := stBand
+    longTakeProfit := close + (risk_pips * 2)
+    strategy.entry("Long", strategy.long, qty=qty) 
+    strategy.exit("Take Profit Long", "Long", stop=longStop, limit=longTakeProfit)
+    label.delete(longLabel)
+    longLabel := label.new(bar_index, longTakeProfit, text="Long TP: " + str.tostring(longTakeProfit, format.mintick), color=color.green, style=label.style_label_up, textcolor=color.white)
+
+if (shortCondition and isTradingHours)
+    shortStop := stBand
+    shortTakeProfit := close - (risk_pips * 2)
+    strategy.entry("Short", strategy.short, qty=qty)
+    strategy.exit("Take Profit Short", "Short", stop=shortStop, limit=shortTakeProfit)
+    label.delete(shortLabel)
+    shortLabel := label.new(bar_index, shortTakeProfit, text="Short TP: " + str.tostring(shortTakeProfit, format.mintick), color=color.red, style=label.style_label_down, textcolor=color.white)
+
+// Plot take profit levels
+plot(longTakeProfit, title="Long Take Profit", color=color.green, style=plot.style_line, linewidth=2)
+plot(shortTakeProfit, title="Short Take Profit", color=color.red, style=plot.style_line, linewidth=2)
+
+// Calculate final capital
+final_capital = initial_capital + cumulative_profit
+
+// Display the final capital at the last bar processed
+//var label capitalLabel = na
+//if (bar_index == ta.highest(bar_index, 1))
+  //  label.delete(capitalLabel)
+  //  capitalLabel := label.new(bar_index, high, "Final Capital: $" + str.tostring(final_capital, format.mintick), color=color.blue, style=label.style_label_down, size=size.large)
+// Display dynamic qty value on the chart
+//var label qtyLabel = na
+//label.delete(qtyLabel)
+//qtyLabel := label.new(bar_index, high, "Qty: " + str.tostring(qty, format.mintick), color=color.yellow, style=label.style_label_up, size=size.large)
+
+// Visualize entries
+plotshape(series=longCondition and isTradingHours, location=location.belowbar, color=color.green, style=shape.labelup, text="BUY")
+plotshape(series=shortCondition and isTradingHours, location=location.abovebar, color=color.red, style=shape.labeldown, text="SELL")
+
+// Plot Supertrend and MACD lines again for clarity
+plot(stBand, "Supertrend", color=stTrend == 1 ? color.green : color.red)
+plot(macdLine, "MACD Line", color=color.blue)
+plot(signalLine, "Signal Line", color=color.orange)
+
+// Display MACD histogram for additional trade confirmation
+plot(macdLine - signalLine, title="MACD Histogram", color=(macdLine - signalLine >= 0 ? color.green : color.red), style=plot.style_histogram)
+
+// Optimization display
+//if (bar_index == ta.highest(bar_index, 1))
+//    label.delete(capitalLabel)
+//    capitalLabel := label.new(bar_index, high, "Final Capital: $" + str.tostring(strategy.equity, format.mintick), color=color.blue, style=label.style_label_down, size=size.large)
