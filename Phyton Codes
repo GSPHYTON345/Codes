@@ -1,0 +1,192 @@
+# === Exact Python replica of your Pine strategy (daily) with trade printout ===
+# - Matches: S-value math, direction rules, and the "own-calendar" lag inside request.security
+# - Execution: each entry is closed next bar (TV: process_orders_on_close + close when long_entry[1])
+
+import pandas as pd
+import numpy as np
+
+# If running in Colab, mount Drive (comment out if not using Drive)
+from google.colab import drive
+drive.mount('/content/drive', force_remount=True)
+
+# -------------------- FILE PATHS (edit to your files) --------------------
+spx_path   = '/content/drive/MyDrive/TVC_SPX, 1D (39).csv'
+vix_path   = '/content/drive/MyDrive/TVC_VIX, 1D (3).csv'
+us10y_path = '/content/drive/MyDrive/TVC_US10Y, 1D (2).csv'
+
+# ----------------- Pine parameters -----------------
+window          = 6
+delta           = 170
+fixed_threshold = 1.0
+sum_threshold   = 3.6
+
+# ----------------- Timezone -----------------
+TZ = "Europe/Zurich"   # <— requested timezone
+
+# ----------------- Variants (Zurich only) -----------------
+# (name, mapping ('asof'|'by_date'), allow_exact (True|False|None), s_round (None|int))
+VARIANTS = [
+    ("zurich_asof_exact",   "asof",   True,  None),
+    ("zurich_asof_prev",    "asof",   False, None),
+    ("zurich_asof_r6",      "asof",   True,  6),
+    ("zurich_by_date",      "by_date",None,  None),
+]
+
+# ----------------- CSV parsing -----------------
+def parse_tv_csv(path, value_cols=('open','high','low','close'), tz=TZ):
+    df = pd.read_csv(path)
+    df.columns = [c.strip().lower() for c in df.columns]
+    if 'time' not in df.columns and 'date' in df.columns:
+        df = df.rename(columns={'date': 'time'})
+    if 'time' not in df.columns:
+        raise ValueError(f"{path}: expected 'time' or 'date' from TradingView export.")
+
+    ser = pd.to_numeric(df['time'], errors='coerce')
+    if ser.notna().any():
+        if ser.dropna().median() > 1e12:
+            t = pd.to_datetime(df['time'], unit='ms', errors='coerce', utc=True)
+        else:
+            t = pd.to_datetime(df['time'], unit='s', errors='coerce', utc=True)
+    else:
+        t = pd.to_datetime(df['time'], errors='coerce', utc=True)
+
+    # convert to Europe/Zurich, then drop tz (naive local timestamps)
+    t = t.dt.tz_convert(tz).dt.tz_localize(None)
+    df['time'] = t
+    df = df.sort_values('time').reset_index(drop=True)
+    cols = ['time'] + [c for c in value_cols if c in df.columns]
+    return df[cols].copy()
+
+# ----------------- Mapping helpers -----------------
+def map_asof(base_times, other_df, cols, allow_exact=True):
+    other_df = other_df.sort_values('time')
+    out = pd.DataFrame({'time': base_times})
+    for c in cols:
+        out = pd.merge_asof(
+            out, other_df[['time', c]].sort_values('time'),
+            on='time', direction='backward', allow_exact_matches=allow_exact
+        )
+    return out.drop(columns=['time'])
+
+def map_by_date(base_times, other_df, cols):
+    base = pd.DataFrame({'date': pd.to_datetime(base_times).dt.date})
+    tmp  = other_df.copy()
+    tmp['date'] = tmp['time'].dt.date
+    m = base.merge(tmp[['date']+cols], on='date', how='left')
+    for c in cols:
+        m[c] = m[c].ffill()
+    return m[cols]
+
+# ----------------- TradingView-style correlation -----------------
+def tv_corr(x: pd.Series, y: pd.Series, w: int) -> pd.Series:
+    xy  = x*y; x2 = x*x; y2 = y*y
+    sx  = x.rolling(w, min_periods=w).sum()
+    sy  = y.rolling(w, min_periods=w).sum()
+    sxy = xy.rolling(w, min_periods=w).sum()
+    sx2 = x2.rolling(w, min_periods=w).sum()
+    sy2 = y2.rolling(w, min_periods=w).sum()
+    num = w*sxy - sx*sy
+    den = np.sqrt((w*sx2 - sx*sx) * (w*sy2 - sy*sy))
+    out = num/den
+    out[den <= 0] = np.nan
+    return out
+
+def calc_S_tv(x: pd.Series, y: pd.Series, w: int, d: int, s_round=None) -> pd.Series:
+    c0 = tv_corr(x,          y,          w)
+    c1 = tv_corr(x.shift(d), y,          w)
+    c2 = tv_corr(x,          y.shift(d), w)
+    c3 = tv_corr(x.shift(d), y.shift(d), w)
+    S  = (c0 + c1 + c2 - c3).abs()
+    if s_round is not None:
+        S = S.round(s_round)
+    return S
+
+def build_variant(name, mapping, allow_exact, s_round):
+    # Load series in Europe/Zurich local time
+    spx_raw   = parse_tv_csv(spx_path,   value_cols=('open','high','low','close'))
+    vix_raw   = parse_tv_csv(vix_path,   value_cols=('close',)).rename(columns={'close':'vix'})
+    us10y_raw = parse_tv_csv(us10y_path, value_cols=('close',)).rename(columns={'close':'us10y'})
+
+    # Child-calendar lags (close[delta] done on each asset’s own timeline)
+    vix_own = vix_raw.copy();   vix_own['vix_lag_own']     = vix_own['vix'].shift(delta)
+    rate_own = us10y_raw.copy(); rate_own['us10y_lag_own'] = rate_own['us10y'].shift(delta)
+
+    base = spx_raw[['time','close']].rename(columns={'close':'spx'}).copy()
+    base_times = base['time']
+
+    # Map to SPX timeline
+    if mapping == 'asof':
+        v_now  = map_asof(base_times, vix_own,   ['vix'],           allow_exact=allow_exact)
+        r_now  = map_asof(base_times, rate_own,  ['us10y'],         allow_exact=allow_exact)
+        v_lag  = map_asof(base_times, vix_own,   ['vix_lag_own'],   allow_exact=allow_exact).rename(columns={'vix_lag_own':'vix_lag'})
+        r_lag  = map_asof(base_times, rate_own,  ['us10y_lag_own'], allow_exact=allow_exact).rename(columns={'us10y_lag_own':'us10y_lag'})
+    elif mapping == 'by_date':
+        v_now  = map_by_date(base_times, vix_own,   ['vix'])
+        r_now  = map_by_date(base_times, rate_own,  ['us10y'])
+        v_lag  = map_by_date(base_times, vix_own,   ['vix_lag_own']).rename(columns={'vix_lag_own':'vix_lag'})
+        r_lag  = map_by_date(base_times, rate_own,  ['us10y_lag_own']).rename(columns={'us10y_lag_own':'us10y_lag'})
+    else:
+        raise ValueError("Unknown mapping")
+
+    df = base.copy()
+    df[['vix']]       = v_now
+    df[['us10y']]     = r_now
+    df[['vix_lag']]   = v_lag
+    df[['us10y_lag']] = r_lag
+
+    for c in ['spx','vix','us10y','vix_lag','us10y_lag']:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+
+    # S-values on SPX calendar (strict TV corr)
+    df['S_vix']   = calc_S_tv(df['spx'], df['vix'],   window, delta, s_round=s_round)
+    df['S_us10y'] = calc_S_tv(df['spx'], df['us10y'], window, delta, s_round=s_round)
+
+    # Pine signal logic
+    df['sig_vix']   = df['S_vix']   > fixed_threshold
+    df['sig_us10y'] = df['S_us10y'] > fixed_threshold
+    df['dir_vix']   = np.where(df['vix_lag']   > df['vix'],   -1, 1)
+    df['dir_us10y'] = np.where(df['us10y_lag'] > df['us10y'], -1, 1)
+    df['combined_dir'] = (df['sig_vix'].astype(int)   * df['dir_vix']) \
+                       + (df['sig_us10y'].astype(int) * df['dir_us10y'])
+    df['sum_s'] = df['S_vix'] + df['S_us10y']
+    df['long_entry'] = (df['combined_dir'] == 2) & (df['sum_s'] > sum_threshold)
+
+    # 1-bar execution (enter close[t], exit close[t+1])
+    entries = df.index[df['long_entry']].to_numpy()
+    exits   = entries + 1
+    ok      = exits < len(df)
+    entries = entries[ok]; exits = exits[ok]
+
+    blotter = pd.DataFrame({
+        'entry_idx'   : entries,
+        'exit_idx'    : exits,
+        'entry_time'  : df.loc[entries, 'time'].values,
+        'exit_time'   : df.loc[exits,  'time'].values,
+        'entry_px'    : df.loc[entries, 'spx'].values,
+        'exit_px'     : df.loc[exits,  'spx'].values,
+        'ret_1bar'    : (df.loc[exits, 'spx'].values / df.loc[entries, 'spx'].values) - 1.0,
+        'S_vix'       : df.loc[entries, 'S_vix'].values,
+        'S_us10y'     : df.loc[entries, 'S_us10y'].values,
+        'sum_s'       : df.loc[entries, 'sum_s'].values,
+        'dir_vix'     : df.loc[entries, 'dir_vix'].values,
+        'dir_us10y'   : df.loc[entries, 'dir_us10y'].values,
+        'combined_dir': df.loc[entries, 'combined_dir'].values
+    })
+
+    print(f"\n=== VARIANT: {name} (tz={TZ}, map={mapping}, allow_exact={allow_exact}, s_round={s_round}) ===")
+    print(f"Rows: {len(df)} | Trades: {len(blotter)}")
+    if len(blotter):
+        print(blotter.head(12).to_string(index=False))
+
+    # Save for 1:1 diff against TradingView
+    out = f"/content/drive/MyDrive/svalue_tv_trades_{name}.csv"
+    try:
+        blotter.to_csv(out, index=False)
+        print(f"Saved: {out}")
+    except Exception as e:
+        print(f"Save error: {e}")
+
+    return df, blotter
+
+# ---- Run Zurich variants ----
+_ = [build_variant(*v) for v in VARIANTS]
