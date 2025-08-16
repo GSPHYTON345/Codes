@@ -1,0 +1,133 @@
+//@version=5
+strategy("Entanglement S-Value Strategy – ALL FOUR gate (Bell + K + SumS + Entropy)",
+     overlay=true,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     process_orders_on_close=true, pyramiding=0)
+
+// ===== Inputs =====
+window        = input.int(6,     "S: Window Size (bars)",    minval=1)
+delta         = input.int(170,   "S: Delta (bars)",          minval=1)
+sum_threshold = input.float(3.6, "S: Sum S-Value Threshold", step=0.1)
+bell_thr      = input.float(2.0, "Bell threshold (CHSH bound)", step=0.1)
+
+// K (Leggett–Garg) inputs
+tauLGI = input.int(10,   "K: lag τ (bars)",   minval=1)
+winK   = input.int(120,  "K: rolling window", minval=20)
+K_thr  = input.float(0.95, "K: threshold (set 1.00 for strict)", step=0.01)  // raise to 1.00 when ready
+
+// K/Entropy source selector
+kSource = input.string("Macro (VIX+US10Y)", "K/Entropy source",
+     options=["Macro (VIX+US10Y)", "Chart EMA trend"])
+emaFast = input.int(30, "Chart EMA fast", minval=1)
+emaSlow = input.int(50, "Chart EMA slow", minval=2)
+
+// Entropy inputs
+entWin = input.int(100, "Entropy window (bars)", minval=20)
+H_max  = input.float(0.65, "Max entropy allowed (0–1)", step=0.01)
+
+// ===== Data =====
+spx       = close
+spx_lag   = request.security(syminfo.tickerid, timeframe.period, close[delta])
+
+vix       = request.security("TVC:VIX",   timeframe.period, close)
+vix_lag   = request.security("TVC:VIX",   timeframe.period, close[delta])
+
+us10y     = request.security("TVC:US10Y", timeframe.period, close)
+us10y_lag = request.security("TVC:US10Y", timeframe.period, close[delta])
+
+// ===== S-Value (CHSH-style) =====
+calc_S(_x, _y) =>
+    c0 = ta.correlation(_x,        _y,        window)
+    c1 = ta.correlation(_x[delta], _y,        window)
+    c2 = ta.correlation(_x,        _y[delta], window)
+    c3 = ta.correlation(_x[delta], _y[delta], window)
+    math.abs(c0 + c1 + c2 - c3)
+
+S_vix   = calc_S(spx, vix)
+S_us10y = calc_S(spx, us10y)
+sum_s   = S_vix + S_us10y
+
+// ===== Bell violation (asterisk ✱) =====
+bell_vix   = S_vix   > bell_thr
+bell_us10y = S_us10y > bell_thr
+bell_any   = bell_vix or bell_us10y
+plotchar(bell_any, title="Bell violation (any)", char="✱",
+         location=location.top, size=size.tiny, color=color.new(color.red, 0))
+
+// ===== K (Leggett–Garg) + Direction label Q_t (±1) =====
+var float Qprev = na
+dir_vix   = vix_lag   > vix   ? -1 : 1
+dir_us10y = us10y_lag > us10y ? -1 : 1
+combined_dir = dir_vix + dir_us10y
+emaF = ta.ema(close, emaFast)
+emaS = ta.ema(close, emaSlow)
+
+// Choose Q source (same Q used for K and Entropy)
+Q_raw =
+     kSource == "Macro (VIX+US10Y)" ? (combined_dir > 0 ? 1 : combined_dir < 0 ? -1 : na) :
+     (emaF > emaS ? 1 : -1)
+
+Q = na(Q_raw) ? (na(Qprev) ? 1 : Qprev) : Q_raw
+Qprev := Q
+
+// K products at lags τ and 2τ
+p12 = Q[2*tauLGI] * Q[tauLGI]
+p23 = Q[tauLGI]   * Q
+p13 = Q[2*tauLGI] * Q
+
+// K rolling means and trigger
+C12 = ta.sma(p12, winK)
+C23 = ta.sma(p23, winK)
+C13 = ta.sma(p13, winK)
+K3        = C12 + C23 - C13
+K_violate = not na(K3) and K3 > K_thr
+
+plot(K3, title="K (LGI K3)", color=color.new(color.purple, 0))
+hline(1.0, "K classical bound", color=color.new(color.purple, 70))
+plotchar(K_violate, title="K > threshold", char="★", location=location.bottom,
+         size=size.tiny, color=color.new(color.purple, 0))
+
+// ===== Entropy of Q over entWin (dot • when low entropy) =====
+// p = fraction of +1 in the last entWin bars
+isPlus = Q == 1 ? 1.0 : 0.0
+p      = ta.sma(isPlus, entWin)   // rolling mean of 0/1 ⇒ fraction in [0,1]
+
+// safe log term
+safeTerm(x) => (x > 0 and x < 1) ? x * math.log(x) : 0.0
+
+Hbits  = not na(p) ? -(safeTerm(p) + safeTerm(1 - p)) / math.log(2) : na  // ∈ [0,1]
+Hnorm  = Hbits
+ent_ok = not na(Hnorm) and Hnorm <= H_max
+
+plot(Hnorm, title="Entropy H (0–1)", color=color.new(color.blue, 0))
+hline(H_max, "H_max", color=color.new(color.blue, 70))
+plotchar(ent_ok, title="Entropy OK (low H)", char="•", location=location.bottom,
+         size=size.tiny, color=color.new(color.blue, 0))
+
+// ===== Triangle for SumS condition =====
+cond_sumS = sum_s > sum_threshold
+plotchar(cond_sumS, title="S-sum exceeds threshold", char="▼",
+         location=location.top, size=size.tiny, color=color.new(color.green, 0))
+
+// ===== ALL FOUR gate (must all be true) =====
+entry_now = cond_sumS and bell_any and K_violate and ent_ok
+
+// Debug columns (which gate is blocking?)
+plot(entry_now ? 1 : 0, title="ALL FOUR gate", style=plot.style_columns, color=color.new(color.lime, 70))
+plot(cond_sumS ? 1 : 0, title="SumS gate",      color=color.new(color.green, 0))
+plot(bell_any ? 1 : 0,  title="Bell gate",      color=color.new(color.red, 0))
+plot(K_violate ? 1 : 0, title="K gate",         color=color.new(color.purple, 0))
+plot(ent_ok ? 1 : 0,    title="Entropy gate",   color=color.new(color.blue, 0))
+
+// ===== Robust orders: enter on this close; exit on next close =====
+var int entryBarIndex = na
+if barstate.isconfirmed
+    if entry_now and strategy.position_size == 0
+        strategy.entry("Long", strategy.long)
+        entryBarIndex := bar_index
+
+    // Exit at the close of the NEXT bar
+    canExit = strategy.position_size > 0 and not na(entryBarIndex) and bar_index >= entryBarIndex + 1
+    if canExit
+        strategy.close("Long")
+        entryBarIndex := na
