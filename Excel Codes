@@ -1,0 +1,168 @@
+# DAJE DEFINITIVO SOLO 1 COPIA INCOLLA CON SPAZIO ANNO
+# Mount Google Drive (if not already mounted)
+from google.colab import drive
+drive.mount('/content/drive', force_remount=False)
+
+import pandas as pd
+import numpy as np
+
+# ============================================
+# Update these paths to match your file locations.
+tv_data_path = '/content/drive/MyDrive/TVC_SPX, 1D (27).csv'
+output_path = '/content/drive/MyDrive/Filled_MODELLO.xlsx'
+
+# Read the TradingView CSV file.
+df = pd.read_csv(tv_data_path)
+
+# Convert 'time' from Unix seconds to datetime in Europe/Berlin, then keep only the date.
+df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+df['time'] = df['time'].dt.tz_convert('Europe/Berlin').dt.date
+
+# Sort the DataFrame by date (ascending).
+df = df.sort_values(by='time').reset_index(drop=True)
+
+# Build a mapping from date to index for fast lookup.
+date_to_idx = {date: idx for idx, date in enumerate(df['time'])}
+
+# Filter rows where a trading signal occurs (either vix or us10y signal equals 1).
+df_signal = df[(df['VIX Trade Signal'] == 1) | (df['US10Y Trade Signal'] == 1)].copy()
+
+# Helper function to safely get candlestick values by index.
+def get_candle_by_index(i, col):
+    if 0 <= i < len(df):
+        return df.loc[i, col]
+    return None
+
+# Function to retrieve candlestick data from various trading-day offsets.
+def get_prior_candles(row):
+    signal_date = row['time']
+    signal_idx = date_to_idx[signal_date]
+
+    # 5 trading days prior for closing value (to become column 6)
+    idx_5 = signal_idx - 5
+    close_5d = get_candle_by_index(idx_5, 'close')
+
+    # 4 trading days prior for high, low, and close (columns 7, 8, 9)
+    idx_4 = signal_idx - 4
+    high_4d = get_candle_by_index(idx_4, 'high')
+    low_4d  = get_candle_by_index(idx_4, 'low')
+    close_4d = get_candle_by_index(idx_4, 'close')
+
+    # 3 trading days prior for high, low, and close (columns 10, 11, 12)
+    idx_3 = signal_idx - 3
+    high_3d = get_candle_by_index(idx_3, 'high')
+    low_3d  = get_candle_by_index(idx_3, 'low')
+    close_3d = get_candle_by_index(idx_3, 'close')
+
+    # 2 trading days prior for high, low, and close (columns 13, 14, 15)
+    idx_2 = signal_idx - 2
+    high_2d = get_candle_by_index(idx_2, 'high')
+    low_2d  = get_candle_by_index(idx_2, 'low')
+    close_2d = get_candle_by_index(idx_2, 'close')
+
+    # 1 trading day prior for high, low, and close (columns 16, 17, 18)
+    idx_1 = signal_idx - 1
+    high_1d = get_candle_by_index(idx_1, 'high')
+    low_1d  = get_candle_by_index(idx_1, 'low')
+    close_1d = get_candle_by_index(idx_1, 'close')
+
+    # Signal day candlestick data (columns 19, 20, 21)
+    high_signal = get_candle_by_index(signal_idx, 'high')
+    low_signal = get_candle_by_index(signal_idx, 'low')
+    close_signal = get_candle_by_index(signal_idx, 'close')
+
+    # 1 trading day after the signal (columns 22, 23, 24)
+    high_after = get_candle_by_index(signal_idx + 1, 'high')
+    low_after = get_candle_by_index(signal_idx + 1, 'low')
+    close_after = get_candle_by_index(signal_idx + 1, 'close')
+
+    return pd.Series({
+        'Close_5d': close_5d,
+        'High_4d': high_4d,
+        'Low_4d': low_4d,
+        'Close_4d': close_4d,
+        'High_3d': high_3d,
+        'Low_3d': low_3d,
+        'Close_3d': close_3d,
+        'High_2d': high_2d,
+        'Low_2d': low_2d,
+        'Close_2d': close_2d,
+        'High_1d': high_1d,
+        'Low_1d': low_1d,
+        'Close_1d': close_1d,
+        'High_signal_day': high_signal,
+        'Low_signal_day': low_signal,
+        'Close_signal_day': close_signal,
+        'High_+1d': high_after,
+        'Low_+1d': low_after,
+        'Close_+1d': close_after
+    })
+
+# Apply the function to each signal row.
+df_signals_prior = df_signal.apply(get_prior_candles, axis=1)
+df_signal = pd.concat([df_signal, df_signals_prior], axis=1)
+
+# Build the final output DataFrame with initial columns.
+df_output = pd.DataFrame({
+    'Trade Number': range(1, len(df_signal) + 1),   # Column 1
+    'Date': df_signal['time'],                        # Column 2
+    'Empty Column': '',                               # Column 3
+    'Year': pd.to_datetime(df_signal['time']).dt.year,       # NEW: extract year of the signal
+    'Vix Signal': df_signal['VIX Trade Signal'],     # 1 if vix signal, 0 if not
+    'Bond Signal': df_signal['US10Y Trade Signal'],  # 1 if US10Y signal, 0 if not
+    'Close_5d': df_signal['Close_5d'],                # Column 6: Close from 5 trading days prior
+    'High_4d': df_signal['High_4d'],                  # Column 7: High from 4 trading days prior
+    'Low_4d': df_signal['Low_4d'],                    # Column 8: Low from 4 trading days prior
+    'Close_4d': df_signal['Close_4d']                 # Column 9: Close from 4 trading days prior
+})
+
+# Insert 3 empty columns after Close_4d
+pos = df_output.columns.get_loc('Close_4d') + 1
+for i in range(3):
+    df_output.insert(pos + i, f'Empty_after_Close_4d_{i+1}', '')
+
+# Add the remaining candlestick columns to df_output
+more_cols = [
+    'High_3d','Low_3d','Close_3d',
+    'High_2d','Low_2d','Close_2d',
+    'High_1d','Low_1d','Close_1d',
+    'High_signal_day','Low_signal_day','Close_signal_day',
+    'High_+1d','Low_+1d','Close_+1d'
+]
+for col in more_cols:
+    df_output[col] = df_signal[col]
+
+# Insert 3 empty columns after Close_3d
+pos = df_output.columns.get_loc('Close_3d') + 1
+for i in range(3):
+    df_output.insert(pos + i, f'Empty_after_Close_3d_{i+1}', '')
+
+# Insert 3 empty columns after Close_2d
+pos = df_output.columns.get_loc('Close_2d') + 1
+for i in range(3):
+    df_output.insert(pos + i, f'Empty_after_Close_2d_{i+1}', '')
+
+# Insert 3 empty columns after Close_1d
+pos = df_output.columns.get_loc('Close_1d') + 1
+for i in range(3):
+    df_output.insert(pos + i, f'Empty_after_Close_1d_{i+1}', '')
+
+# Insert 3 empty columns after Close_signal_day
+pos = df_output.columns.get_loc('Close_signal_day') + 1
+for i in range(3):
+    df_output.insert(pos + i, f'Empty_after_Close_signal_day_{i+1}', '')
+
+# Convert candlestick numeric values to strings with commas as decimal separators.
+candlestick_columns = [
+    'Close_5d','High_4d','Low_4d','Close_4d',
+    'High_3d','Low_3d','Close_3d',
+    'High_2d','Low_2d','Close_2d',
+    'High_1d','Low_1d','Close_1d',
+    'High_signal_day','Low_signal_day','Close_signal_day',
+    'High_+1d','Low_+1d','Close_+1d'
+]
+for col in candlestick_columns:
+    df_output[col] = df_output[col].apply(lambda x: str(x).replace('.',',') if pd.notnull(x) else x)
+
+# Write the final DataFrame to an Excel file.
+df_output.to_excel(output_path, index=False)
