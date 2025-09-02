@@ -1,0 +1,235 @@
+# === Colab: Pattern study for S-value entries (no volume required) ===
+# Uses 'Entry' (or 'Signal') from your TradingView CSV to locate entries.
+# Computes entry-time features: Fractal Dimension (FD), price height vs rolling ranges,
+# ATR context, EMA distances, gaps, weekday/month timing. Skips RVOL if volume absent.
+
+# 0) Mount Drive in Colab
+try:
+    from google.colab import drive  # type: ignore
+    drive.mount('/content/drive')
+except Exception:
+    pass
+
+# 1) Imports & config
+import os, re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+plt.rcParams["figure.figsize"] = (8,4)
+
+# ---- EDIT THIS PATH IF NEEDED ----
+CSV_PATH = "/content/drive/MyDrive/BATS_MSFT, 1D.csv"
+
+# Feature windows
+ATR_LEN  = 14
+EMA_FAST = 20
+EMA_MED  = 50
+EMA_SLOW = 200
+RANGE_LENS = [20, 50, 252]   # price height in rolling window
+FD_LENS    = [32, 64]        # fractal dimension windows
+
+# 2) Helpers
+def clean_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(s).lower())
+
+def find_time_column(df: pd.DataFrame) -> str:
+    for c in df.columns:
+        if clean_name(c) in ("time","datetime","date","timestamp"):
+            return c
+    raise ValueError("No time-like column found (need 'time'/'date').")
+
+def parse_time_index(df: pd.DataFrame, time_col: str) -> pd.DataFrame:
+    s = df[time_col]
+    if np.issubdtype(s.dtype, np.number):
+        # try ms then s
+        try:
+            t = pd.to_datetime(s, unit="ms", utc=False)
+        except Exception:
+            t = pd.to_datetime(s, unit="s",  utc=False)
+    else:
+        t = pd.to_datetime(s, errors="coerce", utc=False, infer_datetime_format=True)
+    if t.isna().any():
+        raise ValueError("Failed to parse some timestamps in time column.")
+    out = df.drop(columns=[time_col]).copy()
+    out.index = t
+    return out.sort_index()
+
+def rename_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    mapping = {}
+    for c in df.columns:
+        cn = clean_name(c)
+        if cn == "open":  mapping[c] = "open"
+        if cn == "high":  mapping[c] = "high"
+        if cn == "low":   mapping[c] = "low"
+        if cn == "close": mapping[c] = "close"
+    return df.rename(columns=mapping)
+
+def find_first_existing(df: pd.DataFrame, names: list[str]) -> str | None:
+    cols = {clean_name(c): c for c in df.columns}
+    for raw in names:
+        k = clean_name(raw)
+        if k in cols:
+            return cols[k]
+    return None
+
+def range_percentile(c: pd.Series, n: int) -> pd.Series:
+    hh = c.rolling(n).max()
+    ll = c.rolling(n).min()
+    rng = hh - ll
+    return (c - ll) / rng.replace(0, np.nan)
+
+def fractal_dimension_series(close: pd.Series, n: int) -> pd.Series:
+    """Ehlers-style FD over window n."""
+    n2 = int(np.floor(n/2))
+    if n2 < 2:
+        return pd.Series(index=close.index, dtype=float)
+    hh_full = close.rolling(n).max()
+    ll_full = close.rolling(n).min()
+    hh_1 = close.rolling(n2).max()
+    ll_1 = close.rolling(n2).min()
+    hh_2 = close.shift(n2).rolling(n2).max()
+    ll_2 = close.shift(n2).rolling(n2).min()
+    num = (hh_1 - ll_1) + (hh_2 - ll_2)
+    den = (hh_full - ll_full)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        D = np.log(num/den) / np.log(2)
+    return D.where((num>0) & (den>0))
+
+def med_iqr(s: pd.Series) -> pd.Series:
+    arr = pd.to_numeric(s, errors="coerce")
+    return pd.Series({
+        "median": np.nanmedian(arr),
+        "p25":    np.nanpercentile(arr, 25),
+        "p75":    np.nanpercentile(arr, 75),
+        "count":  np.isfinite(arr).sum()
+    })
+
+def safe_hist(series, title):
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) >= 5:
+        plt.figure(); plt.hist(s, bins=20)
+        plt.title(title); plt.grid(True); plt.show()
+
+# 3) Load CSV
+if not os.path.exists(CSV_PATH):
+    raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
+
+df_raw = pd.read_csv(CSV_PATH)
+tcol = find_time_column(df_raw)
+df = parse_time_index(df_raw, tcol)
+df = rename_ohlc(df)
+
+print(f"Loaded {len(df):,} bars from {os.path.basename(CSV_PATH)}")
+print("Columns:", list(df.columns))
+
+# 4) Find entries from 'Entry' or 'Signal'
+sig_col = find_first_existing(df, ["Entry","Signal","Long Signal","Buy"])
+if sig_col is None:
+    raise KeyError("No 'Entry' or 'Signal' column found. Re-export with plot(enter_ok?1:na, title='Entry').")
+sig = pd.to_numeric(df[sig_col], errors="coerce").fillna(0.0) > 0
+entries = df.index[sig]
+print(f"Detected {len(entries)} entry bars using '{sig_col}'.")
+
+# 5) Build features (no volume required)
+open_ = pd.to_numeric(df.get("open",  np.nan), errors="coerce")
+high  = pd.to_numeric(df.get("high",  np.nan), errors="coerce")
+low   = pd.to_numeric(df.get("low",   np.nan), errors="coerce")
+close = pd.to_numeric(df.get("close", np.nan), errors="coerce")
+prev_close = close.shift(1)
+
+# ATR-ish context
+tr = pd.DataFrame({
+    "hl": (high - low),
+    "hc": (high - prev_close).abs(),
+    "lc": (low  - prev_close).abs()
+}).max(axis=1)
+atr = tr.rolling(ATR_LEN).mean()
+tr_over_atr = tr / atr
+
+# EMA distances (20/50/200)
+ema20  = close.ewm(span=EMA_FAST, adjust=False).mean()
+ema50  = close.ewm(span=EMA_MED,  adjust=False).mean()
+ema200 = close.ewm(span=EMA_SLOW, adjust=False).mean()
+dist_ema20  = (close - ema20)  / ema20
+dist_ema50  = (close - ema50)  / ema50
+dist_ema200 = (close - ema200) / ema200
+
+# Price “height” percentiles in rolling ranges
+pct_cols = {f"pct_{n}": range_percentile(close, n) for n in RANGE_LENS}
+
+# Opening gap %
+gap_pct = (open_ / prev_close - 1.0)
+
+# Fractal Dimensions
+fd_cols = {f"FD_{n}": fractal_dimension_series(close, n) for n in FD_LENS}
+
+# Assemble feature frame
+feat = pd.DataFrame(
+    {
+        "tr_over_atr": tr_over_atr,
+        "dist_ema20":  dist_ema20,
+        "dist_ema50":  dist_ema50,
+        "dist_ema200": dist_ema200,
+        "gap_pct":     gap_pct,
+        "weekday": pd.Categorical(pd.to_datetime(df.index).day_name(),
+                                  categories=["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"],
+                                  ordered=True),
+        "month":   pd.to_datetime(df.index).month,
+        "close":   close
+    }, index=df.index
+)
+for k,v in pct_cols.items(): feat[k] = v
+for k,v in fd_cols.items():  feat[k] = v
+
+# Slice features on entry bars
+ef = feat.loc[entries].copy()
+
+# 6) Pattern outputs (no P&L)
+print("\n=== Entry timing patterns ===")
+by_wd = ef.groupby("weekday").size().reindex(feat["weekday"].cat.categories).fillna(0).astype(int)
+print("Counts by weekday:\n", by_wd)
+
+by_month = ef.groupby("month").size().reindex(range(1,13)).fillna(0).astype(int)
+print("\nCounts by month:\n", by_month)
+
+print("\n=== Entry feature snapshots (median / IQR / count) ===")
+num_cols = ["tr_over_atr","dist_ema20","dist_ema50","dist_ema200","gap_pct"] \
+           + list(pct_cols.keys()) + list(fd_cols.keys())
+print(ef[num_cols].apply(med_iqr).T.round(4))
+
+# 7) Cross-tab: FD vs price height (longest windows)
+if len(ef) >= 10:
+    fd_key  = f"FD_{FD_LENS[-1]}"      # e.g., FD_64
+    pct_key = f"pct_{RANGE_LENS[-1]}"  # e.g., pct_252
+    try:
+        ef["FD_bucket"] = pd.qcut(ef[fd_key],  q=4, duplicates="drop")
+        ef["HT_bucket"] = pd.qcut(ef[pct_key], q=4, duplicates="drop")
+        ct = pd.crosstab(ef["FD_bucket"], ef["HT_bucket"])
+        print(f"\nCross-tab (counts): {fd_key} quartiles vs {pct_key} quartiles\n", ct)
+    except Exception as e:
+        print("\nCross-tab skipped (insufficient unique values).", e)
+else:
+    print("\nCross-tab skipped (need ≥10 entries).")
+
+# 8) Visuals: distributions (skip if too few)
+def maybe_plot(series, title):
+    s = pd.to_numeric(series, errors="coerce").dropna()
+    if len(s) >= 10:
+        plt.figure(); plt.hist(s, bins=20)
+        plt.title(title); plt.grid(True); plt.show()
+
+maybe_plot(ef["tr_over_atr"], "Entry TR/ATR")
+maybe_plot(ef["dist_ema20"],  "Entry distance to EMA20")
+maybe_plot(ef["dist_ema50"],  "Entry distance to EMA50")
+maybe_plot(ef["dist_ema200"], "Entry distance to EMA200")
+for n in RANGE_LENS: maybe_plot(ef[f"pct_{n}"], f"Entry price percentile in {n}-bar range")
+for n in FD_LENS:    maybe_plot(ef[f"FD_{n}"],  f"Entry Fractal Dimension FD_{n}")
+
+# 9) Save entry-feature table to Drive
+out_dir = os.path.join(os.path.dirname(CSV_PATH), "analysis_outputs")
+os.makedirs(out_dir, exist_ok=True)
+ef.to_csv(os.path.join(out_dir, "entry_features.csv"))
+by_wd.to_csv(os.path.join(out_dir, "entry_counts_by_weekday.csv"))
+by_month.to_csv(os.path.join(out_dir, "entry_counts_by_month.csv"))
+print("\nSaved entry feature tables to:", out_dir)
