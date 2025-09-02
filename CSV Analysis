@@ -20,7 +20,7 @@ from datetime import timedelta
 plt.rcParams["figure.figsize"] = (8,4)
 
 # ---- EDIT THESE ----
-CSV_PATH     = "/content/drive/MyDrive/tradingview_exports/BATS_MSFT, 1D.csv"
+CSV_PATH     = "/content/drive/MyDrive/BATS_MSFT, 1D.csv"
 S_THRESHOLD  = 2.8          # same fixed S threshold you used in Pine
 AGGREGATOR   = "MAX"        # how to combine S1/S2/S3 if S_agg missing: "MAX" | "MEAN"
 BLOCK_FRI_ENTRIES = True    # match Pine behavior (no Friday entries)
@@ -238,8 +238,8 @@ if len(tr):
     plt.figure(); plt.hist(tr["ret"], bins=40)
     plt.title("Trade Return Distribution"); plt.xlabel("Return"); plt.ylabel("Count"); plt.grid(True); plt.show()
 
-    # By entry weekday
-    tr["weekday"] = pd.to_datetime(tr["entry_time"]).day_name()
+    # By entry weekday (FIXED: use .dt.day_name())
+    tr["weekday"] = pd.to_datetime(tr["entry_time"]).dt.day_name()
     order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
     tr["weekday"] = pd.Categorical(tr["weekday"], categories=order, ordered=True)
     by_wd = tr.groupby("weekday")["ret"].agg(["count","mean","median"]).sort_index()
@@ -272,3 +272,5 @@ if len(tr):
     print("Saved outputs to:", out_dir)
 else:
     print("No trades built. If your CSV lacks both 'Signal' and any S columns, re-export with plot(S_agg) or S1/S2/S3.")
+
+
