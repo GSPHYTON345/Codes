@@ -1,0 +1,274 @@
+# === Colab: analyze TradingView export (PV + V↔RVOL S signals) ===
+# Robust to missing 'Signal' column: reconstructs entries from S_agg or S1/S2/S3 + manual S_THRESHOLD.
+
+# 0) Drive mount (if in Colab)
+try:
+    from google.colab import drive  # type: ignore
+    drive.mount('/content/drive')
+    IN_COLAB = True
+except Exception:
+    IN_COLAB = False
+    print("Not in Colab or Drive not available; continuing without Drive mount.")
+
+# 1) Imports & config
+import os, re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import timedelta
+
+plt.rcParams["figure.figsize"] = (8,4)
+
+# ---- EDIT THESE ----
+CSV_PATH     = "/content/drive/MyDrive/tradingview_exports/BATS_MSFT, 1D.csv"
+S_THRESHOLD  = 2.8          # same fixed S threshold you used in Pine
+AGGREGATOR   = "MAX"        # how to combine S1/S2/S3 if S_agg missing: "MAX" | "MEAN"
+BLOCK_FRI_ENTRIES = True    # match Pine behavior (no Friday entries)
+
+# 2) Helpers
+def clean_name(s: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+def find_time_column(df: pd.DataFrame) -> str:
+    for c in df.columns:
+        if clean_name(c) in ("time","datetime","date","timestamp"):
+            return c
+    raise ValueError("No time-like column found (need 'time', 'date', etc.).")
+
+def parse_time_index(df: pd.DataFrame, time_col: str) -> pd.DataFrame:
+    s = df[time_col]
+    if np.issubdtype(s.dtype, np.number):
+        # try ms then s
+        try:
+            t = pd.to_datetime(s, unit="ms", utc=False)
+        except Exception:
+            t = pd.to_datetime(s, unit="s", utc=False)
+    else:
+        t = pd.to_datetime(s, errors="coerce", utc=False, infer_datetime_format=True)
+    if t.isna().any():
+        raise ValueError("Failed to parse some timestamps in time column.")
+    out = df.drop(columns=[time_col]).copy()
+    out.index = t
+    return out.sort_index()
+
+def rename_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
+    mapping = {}
+    for c in df.columns:
+        cn = clean_name(c)
+        if cn == "open":  mapping[c] = "open"
+        if cn == "high":  mapping[c] = "high"
+        if cn == "low":   mapping[c] = "low"
+        if cn == "close": mapping[c] = "close"
+        if cn in ("vol","volume"): mapping[c] = "Volume"
+    return df.rename(columns=mapping)
+
+def last_bar_of_day(df: pd.DataFrame, day_date) -> pd.Timestamp | None:
+    rows = df.loc[df.index.date == day_date]
+    return None if rows.empty else rows.index[-1]
+
+def next_friday(ts: pd.Timestamp) -> pd.Timestamp.date:
+    wd = ts.weekday()
+    offset = (4 - wd) % 7
+    if offset == 0:
+        offset = 7
+    return (ts + pd.Timedelta(days=offset)).date()
+
+def find_first_existing(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    cols = {clean_name(c): c for c in df.columns}
+    for raw in candidates:
+        k = clean_name(raw)
+        if k in cols:
+            return cols[k]
+    return None
+
+def reconstruct_S_agg(df: pd.DataFrame, aggregator: str = "MAX") -> pd.Series:
+    # Try common S_agg names first
+    sagg_col = find_first_existing(df, ["S_agg","S agg","S_agg (aggregated)","Aggregated S","S"])
+    if sagg_col:
+        return pd.to_numeric(df[sagg_col], errors="coerce")
+
+    # Else try to build from S1/S2/S3
+    s1 = find_first_existing(df, ["S1_sum","S1","S1 sum","S1_sum (PV + V↔RVOL)"])
+    s2 = find_first_existing(df, ["S2_sum","S2","S2 sum","S2_sum (PV + V↔RVOL)"])
+    s3 = find_first_existing(df, ["S3_sum","S3","S3 sum","S3_sum (PV + V↔RVOL)"])
+
+    if not any([s1, s2, s3]):
+        raise KeyError("Could not find S_agg nor S1/S2/S3 columns. "
+                       "Re-export CSV with plot(S_agg) or plot(S1_sum/S2_sum/S3_sum).")
+
+    parts = []
+    if s1: parts.append(pd.to_numeric(df[s1], errors="coerce"))
+    if s2: parts.append(pd.to_numeric(df[s2], errors="coerce"))
+    if s3: parts.append(pd.to_numeric(df[s3], errors="coerce"))
+
+    # Stack to (n_rows, n_parts)
+    S = pd.concat(parts, axis=1)
+    if aggregator.upper() == "MEAN":
+        return S.mean(axis=1, skipna=True)
+    # default MAX
+    return S.max(axis=1, skipna=True)
+
+def build_trades_from_series(df: pd.DataFrame,
+                             s_series: pd.Series,
+                             s_threshold: float,
+                             block_fri_entries: bool = True) -> pd.DataFrame:
+    """One-pass scan: enter when S>S_THRESHOLD (and not Friday if blocked); exit on next Friday's last bar; skip overlaps."""
+    idx = df.index
+    n = len(df)
+    i = 0
+    trades = []
+    while i < n:
+        ts = idx[i]
+        # skip Friday entries if requested
+        if block_fri_entries and ts.weekday() == 4:
+            i += 1
+            continue
+        # signal?
+        try:
+            s_val = float(s_series.iloc[i])
+        except Exception:
+            s_val = np.nan
+        if np.isfinite(s_val) and (s_val > s_threshold):
+            # open here, find exit
+            entry_time = ts
+            entry_px   = float(df.iloc[i]["close"])
+            nf = next_friday(ts)
+            exit_idx = last_bar_of_day(df, nf)
+            if exit_idx is None:
+                # look forward up to 4 more weeks for a Friday with data
+                found = False
+                for wk in range(1, 5):
+                    later = (pd.Timestamp(nf) + pd.Timedelta(days=7*wk)).date()
+                    exit_idx = last_bar_of_day(df, later)
+                    if exit_idx is not None:
+                        found = True
+                        break
+                if not found:
+                    # can't close this one -> skip & advance
+                    i += 1
+                    continue
+            exit_px = float(df.loc[exit_idx, "close"])
+            ret = exit_px / entry_px - 1.0
+            trades.append({
+                "entry_time": entry_time,
+                "exit_time":  exit_idx,
+                "entry_px":   entry_px,
+                "exit_px":    exit_px,
+                "ret":        ret,
+                "S_agg_at_entry": s_val
+            })
+            # jump i to the bar AFTER exit to avoid overlaps
+            # (position is flat again only after weekly exit)
+            i = np.searchsorted(idx.values, exit_idx.to_datetime64()) + 1
+            continue
+        i += 1
+    return pd.DataFrame(trades)
+
+# 3) Load CSV
+if not os.path.exists(CSV_PATH):
+    raise FileNotFoundError(f"CSV not found: {CSV_PATH}")
+
+df0 = pd.read_csv(CSV_PATH)
+tcol = find_time_column(df0)
+df  = parse_time_index(df0, tcol)
+df  = rename_ohlcv(df)
+
+# 4) Try to use Signal if present; else reconstruct from S_agg / S1..S3 + threshold
+sig_col = find_first_existing(df, ["Signal","ENTRY","Entry","Long Signal","Buy"])
+if sig_col is not None:
+    # Use provided Signal column
+    sig = pd.to_numeric(df[sig_col], errors="coerce")
+    entries = df.index[(sig.fillna(0.0) > 0.0)].to_list()
+    # Build trades with Friday exits, no overlaps
+    trades = []
+    last_exit_t = None
+    for t in entries:
+        if BLOCK_FRI_ENTRIES and pd.Timestamp(t).weekday() == 4:
+            continue
+        if last_exit_t is not None and t <= last_exit_t:
+            # overlap -> skip this entry
+            continue
+        entry_px = float(df.loc[t, "close"])
+        nf = next_friday(pd.Timestamp(t))
+        exit_idx = last_bar_of_day(df, nf)
+        if exit_idx is None:
+            found = False
+            for wk in range(1, 5):
+                later = (pd.Timestamp(nf) + pd.Timedelta(days=7*wk)).date()
+                exit_idx = last_bar_of_day(df, later)
+                if exit_idx is not None:
+                    found = True
+                    break
+            if not found:
+                continue
+        exit_px = float(df.loc[exit_idx, "close"])
+        ret = exit_px / entry_px - 1.0
+        s_at = float(df.loc[t, sig_col]) if sig_col in df.columns else np.nan
+        trades.append({"entry_time": t, "exit_time": exit_idx, "entry_px": entry_px,
+                       "exit_px": exit_px, "ret": ret, "Signal_val": s_at})
+        last_exit_t = exit_idx
+    tr = pd.DataFrame(trades).sort_values("entry_time").reset_index(drop=True)
+    S_used = None
+else:
+    # No Signal: reconstruct S_agg (or from S1..S3), then generate entries using S_THRESHOLD
+    S_used = reconstruct_S_agg(df, AGGREGATOR)
+    tr = build_trades_from_series(df, S_used, S_THRESHOLD, BLOCK_FRI_ENTRIES)
+
+print(f"Loaded {len(df):,} bars from {os.path.basename(CSV_PATH)}")
+print(f"Constructed {len(tr):,} trades with Friday exits.\n")
+
+# 5) Stats & visuals
+if len(tr):
+    win_rate = (tr["ret"] > 0).mean()
+    avg_ret  = tr["ret"].mean()
+    med_ret  = tr["ret"].median()
+    std_ret  = tr["ret"].std(ddof=1) if len(tr) > 1 else np.nan
+    tot_mult = float((1.0 + tr["ret"]).prod())
+
+    print(f"Win rate: {win_rate:.2%}")
+    print(f"Avg: {avg_ret:.3%} | Median: {med_ret:.3%} | Std: {std_ret:.3%}")
+    print(f"Terminal multiple (per-trade compounding): {tot_mult:.2f}×\n")
+
+    # Equity curve by exit time
+    eq = (1.0 + tr["ret"]).cumprod()
+    plt.figure(); plt.plot(tr["exit_time"], eq)
+    plt.title("Equity Curve (weekly exits)"); plt.xlabel("Exit time"); plt.ylabel("Equity (× start)"); plt.grid(True); plt.show()
+
+    # Return distribution
+    plt.figure(); plt.hist(tr["ret"], bins=40)
+    plt.title("Trade Return Distribution"); plt.xlabel("Return"); plt.ylabel("Count"); plt.grid(True); plt.show()
+
+    # By entry weekday
+    tr["weekday"] = pd.to_datetime(tr["entry_time"]).day_name()
+    order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    tr["weekday"] = pd.Categorical(tr["weekday"], categories=order, ordered=True)
+    by_wd = tr.groupby("weekday")["ret"].agg(["count","mean","median"]).sort_index()
+    print("By entry weekday:\n", by_wd, "\n")
+
+    # By S-strength at entry (if reconstructed S was used)
+    if S_used is not None:
+        s_at = []
+        for t in tr["entry_time"]:
+            try:
+                s_at.append(float(S_used.loc[t]))
+            except Exception:
+                s_at.append(np.nan)
+        tr["S_agg_at_entry"] = s_at
+        if tr["S_agg_at_entry"].notna().sum() >= 10:
+            try:
+                tr["S_bucket"] = pd.qcut(tr["S_agg_at_entry"], q=4, duplicates="drop")
+                by_bucket = tr.groupby("S_bucket")["ret"].agg(["count","mean","median"])
+                print("By S_agg quartile at entry:\n", by_bucket, "\n")
+            except Exception as e:
+                print("Skipping S_agg bucketing (not enough unique values).", e)
+
+    # 6) Save outputs next to CSV
+    out_dir = os.path.join(os.path.dirname(CSV_PATH), "analysis_outputs")
+    os.makedirs(out_dir, exist_ok=True)
+    tr.to_csv(os.path.join(out_dir, "trades_parsed.csv"), index=False)
+    by_wd.to_csv(os.path.join(out_dir, "by_weekday.csv"))
+    if "S_bucket" in tr.columns:
+        by_bucket.to_csv(os.path.join(out_dir, "by_Sbucket.csv"))
+    print("Saved outputs to:", out_dir)
+else:
+    print("No trades built. If your CSV lacks both 'Signal' and any S columns, re-export with plot(S_agg) or S1/S2/S3.")
